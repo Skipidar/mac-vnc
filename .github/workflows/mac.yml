@@ -1,0 +1,86 @@
+name: mac
+on:
+  workflow_dispatch:
+    inputs:
+      vnc_password:
+        description: "VNC password (min 8 chars)"
+        required: true
+        default: "freemilk123"
+
+jobs:
+  mac:
+    runs-on: macos-14
+    timeout-minutes: 350
+    steps:
+      - name: Runner info
+        run: |
+          sw_vers
+          uname -m
+          sysctl -n machdep.cpu.brand_string
+
+      - name: Install cloudflared
+        run: |
+          brew install cloudflared
+          which cloudflared || true
+
+      - name: Download and install FreeMilk
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -L --fail -o FreeMilk.dmg https://www.freemilk.ai/download/mac
+          ls -la FreeMilk.dmg
+          hdiutil attach FreeMilk.dmg -nobrowse -mountpoint "$RUNNER_TEMP/mnt"
+          cp -R "$RUNNER_TEMP/mnt/FreeMilk.app" /Applications/ 2>/dev/null || true
+          hdiutil detach "$RUNNER_TEMP/mnt" || true
+          xattr -dr com.apple.quarantine /Applications/FreeMilk.app 2>/dev/null || true
+          ls -la /Applications/FreeMilk.app/Contents/MacOS/ 2>/dev/null || echo "app not found"
+
+      - name: Enable Screen Sharing (VNC) on macOS
+        env:
+          VNC_PASSWORD: ${{ inputs.vnc_password }}
+        run: |
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -activate -configure -access -on -restart -agent -privs -all 2>&1 | tail -5 || true
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -configure -clientopts -setvnclegacy -vnclegacy yes 2>&1 | tail -3 || true
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -configure -clientopts -setvncpw -vncpw "$VNC_PASSWORD" 2>&1 | tail -3 || true
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -restart -agent -privs -all 2>&1 | tail -3 || true
+          sleep 5
+          lsof -iTCP:5900 -sTCP:LISTEN || echo "5900 not listening"
+
+      - name: Launch FreeMilk
+        run: |
+          open -a /Applications/FreeMilk.app 2>&1 || echo "open failed"
+          sleep 12
+          pgrep -fl -i milk || echo "no milk process"
+
+      - name: Start public tunnel and print address
+        run: |
+          nohup cloudflared tunnel --url tcp://localhost:5900 --no-autoupdate > /tmp/tunnel.log 2>&1 &
+          for i in $(seq 1 45); do
+            if grep -qo 'https://[a-z0-9-]*\.trycloudflare\.com' /tmp/tunnel.log; then break; fi
+            sleep 2
+          done
+          cat /tmp/tunnel.log | tail -30
+          URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' /tmp/tunnel.log | head -1)
+          echo "VNC_ADDRESS=$URL"
+          echo "VNC_PASSWORD=${{ inputs.vnc_password }}"
+          {
+            echo "## VNC ready"
+            echo ""
+            echo "Address: \`$URL\`"
+            echo ""
+            echo "Password: \`${{ inputs.vnc_password }}\`"
+            echo ""
+            echo "Connect with TigerVNC / RealVNC viewer to that host on port 443 (or as vnc:// URL)."
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Keep session alive (5 min heartbeat)
+        run: |
+          for i in $(seq 1 68); do
+            echo "[$(date -u +%H:%M:%S)] alive $i/68"
+            lsof -iTCP:5900 -sTCP:LISTEN | tail -1 || echo "vnc down"
+            sleep 300
+          done
+        timeout-minutes: 345
